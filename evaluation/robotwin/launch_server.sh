@@ -9,6 +9,7 @@ BENCH_MODULES=${BENCH_MODULES:-all}
 BENCH_STEP_ENABLE=${BENCH_STEP_ENABLE:-0}
 BENCH_STEP_MAX_SAMPLES=${BENCH_STEP_MAX_SAMPLES:-0}
 BENCH_KV_ENABLE=${BENCH_KV_ENABLE:-0}
+ENABLE_CROSS_KV_CACHE=${ENABLE_CROSS_KV_CACHE:-0}
 ATTN_WINDOW=${ATTN_WINDOW:-}
 BENCH_ARGS=()
 if [ "$BENCH_ENABLE" = "1" ]; then
@@ -26,6 +27,10 @@ fi
 if [ -n "$ATTN_WINDOW" ]; then
   BENCH_ARGS+=(--attn-window "$ATTN_WINDOW")
   echo "[launch_server] attn_window override: $ATTN_WINDOW"
+fi
+if [ "$ENABLE_CROSS_KV_CACHE" = "1" ]; then
+  BENCH_ARGS+=(--enable-cross-kv-cache)
+  echo "[launch_server] cross-attn KV cache enabled"
 fi
 
 python -m torch.distributed.run \

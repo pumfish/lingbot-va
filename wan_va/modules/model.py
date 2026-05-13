@@ -8,6 +8,7 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributed.tensor import DTensor, Replicate, distribute_tensor
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import (
@@ -536,11 +537,18 @@ class WanAttention(torch.nn.Module):
         update_cache=0,
         cache_name='pos',
         profile_stage='unknown',
+        preprojected_kv: bool = False,
     ):
         kv_cache = self.attn_caches[
             cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
 
-        query, key, value = self.to_q(q), self.to_k(k), self.to_v(v)
+        query = self.to_q(q)
+        if preprojected_kv:
+            key = k
+            value = v
+        else:
+            key = self.to_k(k)
+            value = self.to_v(v)
         query = self.norm_q(query)
         query = query.unflatten(2, (self.heads, -1))
         key = self.norm_k(key)
@@ -684,6 +692,8 @@ class WanTransformerBlock(nn.Module):
         update_cache=0,
         cache_name='pos',
         profile_stage='unknown',
+        cross_k_cache=None,
+        cross_v_cache=None,
     ) -> torch.Tensor:
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
@@ -712,11 +722,12 @@ class WanTransformerBlock(nn.Module):
         norm_hidden_states = self.norm2(
             hidden_states.float()).type_as(hidden_states)
         attn_output = self.attn2(norm_hidden_states,
-                                 encoder_hidden_states,
-                                 encoder_hidden_states,
+                                 cross_k_cache if cross_k_cache is not None else encoder_hidden_states,
+                                 cross_v_cache if cross_v_cache is not None else encoder_hidden_states,
                                  None,
                                  update_cache=0,
-                                 cache_name=cache_name)
+                                 cache_name=cache_name,
+                                 preprojected_kv=(cross_k_cache is not None and cross_v_cache is not None))
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
@@ -783,6 +794,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         self.patch_size = patch_size
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
+        self.enable_cross_kv_cache = bool(int(os.getenv("ENABLE_CROSS_KV_CACHE", "0")))
+        self.cross_kv_cache: dict[str, dict] = {}
         inner_dim = num_attention_heads * attention_head_dim
         self.rope = WanRotaryPosEmbed(attention_head_dim, patch_size,
                                       rope_max_seq_len)
@@ -822,6 +835,66 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
     def clear_pred_cache(self, cache_name):
         for block in self.blocks:
             block.attn1.clear_pred_cache(cache_name)
+
+    def set_cross_kv_cache_enabled(self, enabled: bool) -> None:
+        self.enable_cross_kv_cache = bool(enabled)
+        if not self.enable_cross_kv_cache:
+            self.clear_cross_kv_cache()
+
+    def clear_cross_kv_cache(self):
+        self.cross_kv_cache = {}
+
+    def _cross_cache_mode_key(self, action_mode: bool) -> str:
+        return "action" if action_mode else "video"
+
+    def _cross_cache_text_signature(self, text_hidden_states: torch.Tensor) -> tuple:
+        with torch.no_grad():
+            x = text_hidden_states.detach()
+            flat = x.reshape(-1).float()
+            first = float(flat[0].item()) if flat.numel() > 0 else 0.0
+            total = float(flat.sum().item()) if flat.numel() > 0 else 0.0
+            mean = float(flat.mean().item()) if flat.numel() > 0 else 0.0
+            return (
+                tuple(int(v) for v in x.shape),
+                str(x.dtype),
+                str(x.device),
+                total,
+                mean,
+                first,
+            )
+
+    def _match_tensor_layout_for_linear(self, x: torch.Tensor, linear_module: nn.Module) -> torch.Tensor:
+        weight = getattr(linear_module, "weight", None)
+        if isinstance(x, DTensor) or not isinstance(weight, DTensor):
+            return x
+        device_mesh = weight.device_mesh
+        placements = [Replicate() for _ in range(device_mesh.ndim)]
+        return distribute_tensor(x, device_mesh=device_mesh, placements=placements)
+
+    @staticmethod
+    def _to_local_tensor_if_needed(x: torch.Tensor) -> torch.Tensor:
+        return x.to_local() if isinstance(x, DTensor) else x
+
+    def get_or_build_cross_kv_cache(self, text_hidden_states: torch.Tensor, action_mode: bool) -> list[dict[str, torch.Tensor]] | None:
+        if not self.enable_cross_kv_cache:
+            return None
+        mode_key = self._cross_cache_mode_key(action_mode)
+        sig = self._cross_cache_text_signature(text_hidden_states)
+        cached = self.cross_kv_cache.get(mode_key)
+        if cached is not None and cached.get("signature") == sig:
+            return cached.get("blocks")
+        blocks_cache: list[dict[str, torch.Tensor]] = []
+        for block in self.blocks:
+            with torch.no_grad():
+                text_hidden_states_k = self._match_tensor_layout_for_linear(text_hidden_states, block.attn2.to_k)
+                text_hidden_states_v = self._match_tensor_layout_for_linear(text_hidden_states, block.attn2.to_v)
+                k_proj = block.attn2.to_k(text_hidden_states_k)
+                v_proj = block.attn2.to_v(text_hidden_states_v)
+                k_proj = self._to_local_tensor_if_needed(k_proj)
+                v_proj = self._to_local_tensor_if_needed(v_proj)
+            blocks_cache.append({"k": k_proj, "v": v_proj})
+        self.cross_kv_cache[mode_key] = {"signature": sig, "blocks": blocks_cache}
+        return blocks_cache
 
     def create_empty_cache(self, cache_name, attn_window,
                            latent_token_per_chunk, action_token_per_chunk,
@@ -1008,6 +1081,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                 latent_hidden_states)
         text_hidden_states = self.condition_embedder.text_embedder(
             input_dict["text_emb"])  # B L2 C
+        cross_kv_cache_blocks = self.get_or_build_cross_kv_cache(
+            text_hidden_states=text_hidden_states,
+            action_mode=bool(action_mode),
+        )
 
         latent_grid_id = input_dict['grid_id']
         rotary_emb = self.rope(latent_grid_id)[:, :, None]  # 1 L 1 C
@@ -1023,14 +1100,21 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_time_steps, dtype=latent_hidden_states.dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
+            cross_k_cache = None
+            cross_v_cache = None
+            if cross_kv_cache_blocks is not None:
+                cross_k_cache = cross_kv_cache_blocks[block_idx]["k"]
+                cross_v_cache = cross_kv_cache_blocks[block_idx]["v"]
             latent_hidden_states = block(latent_hidden_states,
                                          text_hidden_states,
                                          timestep_proj,
                                          rotary_emb,
                                          update_cache=update_cache,
                                          cache_name=cache_name,
-                                         profile_stage=profile_stage)
+                                         profile_stage=profile_stage,
+                                         cross_k_cache=cross_k_cache,
+                                         cross_v_cache=cross_v_cache)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

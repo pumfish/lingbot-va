@@ -53,6 +53,7 @@ class VA_Server:
         self.bench_step_enable = bool(getattr(job_config, "bench_step_enable", False))
         self.bench_step_max_samples = int(getattr(job_config, "bench_step_max_samples", 0))
         self.bench_kv_enable = bool(getattr(job_config, "bench_kv_enable", False))
+        self.enable_cross_kv_cache = bool(getattr(job_config, "enable_cross_kv_cache", False))
 
         self.debug_io = bool(int(os.getenv("DEBUG_IO", "0"))) or bool(getattr(job_config, "debug_io", False))
         self._debug_io_print_limit = int(os.getenv("DEBUG_IO_PRINT_LIMIT", "200"))
@@ -104,6 +105,8 @@ class VA_Server:
             self.transformer.set_kv_bench_enabled(self.bench_kv_enable)
             if self.bench_kv_enable and hasattr(self.transformer, "reset_kv_bench_stats"):
                 self.transformer.reset_kv_bench_stats()
+        if hasattr(self.transformer, "set_cross_kv_cache_enabled"):
+            self.transformer.set_cross_kv_cache_enabled(self.enable_cross_kv_cache)
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
@@ -517,6 +520,8 @@ class VA_Server:
         self.init_latent = None
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
+        if hasattr(self.transformer, "clear_cross_kv_cache"):
+            self.transformer.clear_cross_kv_cache()
         self.streaming_vae.clear_cache()
 
         self.action_per_frame = self.job_config.action_per_frame
@@ -1000,6 +1005,7 @@ def run(args):
         config.save_root = args.save_root
     if args.attn_window is not None:
         config.attn_window = int(args.attn_window)
+    config.enable_cross_kv_cache = bool(getattr(args, "enable_cross_kv_cache", False))
     config.bench_enable = args.bench_enable
     config.bench_modules = args.bench_modules
     config.bench_step_enable = args.bench_step_enable
@@ -1078,6 +1084,11 @@ def main():
         type=int,
         default=None,
         help="override config attn_window for cache-window sensitivity experiments",
+    )
+    parser.add_argument(
+        "--enable-cross-kv-cache",
+        action="store_true",
+        help="cache per-block cross-attention projected K/V within one episode to avoid repeated text K/V projection",
     )
     args = parser.parse_args()
     run(args)
