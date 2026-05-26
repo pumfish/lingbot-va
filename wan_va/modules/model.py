@@ -1,9 +1,6 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
 import math
-import os
-import time
 from copy import deepcopy
-from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -291,115 +288,6 @@ class WanRotaryPosEmbed(nn.Module):
 
 class WanAttention(torch.nn.Module):
 
-    _global_kv_break_count = 0
-    _kv_bench_enabled = False
-    _kv_bench_stats = {"by_stage": {}}
-
-    @classmethod
-    def set_kv_bench_enabled(cls, enabled: bool) -> None:
-        cls._kv_bench_enabled = bool(enabled)
-
-    @classmethod
-    def reset_kv_bench_stats(cls) -> None:
-        cls._kv_bench_stats = {"by_stage": {}}
-
-    @classmethod
-    def _stage_bucket(cls, stage: str) -> dict:
-        by_stage = cls._kv_bench_stats.setdefault("by_stage", {})
-        if stage not in by_stage:
-            by_stage[stage] = {
-                "self_attn_calls": 0,
-                "update_cache_0_calls": 0,
-                "update_cache_1_calls": 0,
-                "update_cache_2_calls": 0,
-                "kv_update_store_ms_total": 0.0,
-                "kv_update_store_calls": 0,
-                "kv_gather_read_ms_total": 0.0,
-                "kv_gather_read_calls": 0,
-                "kv_restore_temp_ms_total": 0.0,
-                "kv_restore_temp_calls": 0,
-                "new_tokens_total": 0,
-                "valid_tokens_total": 0,
-                "evict_tokens_total": 0,
-                "cache_capacity_tokens_max": 0,
-            }
-        return by_stage[stage]
-
-    @classmethod
-    def _acc_kv_stat(
-        cls,
-        stage: str,
-        update_cache: int,
-        new_tokens: int,
-        valid_tokens: int,
-        evict_tokens: int,
-        cache_capacity: int,
-        update_store_ms: float = 0.0,
-        gather_read_ms: float = 0.0,
-        restore_ms: float = 0.0,
-        count_call: bool = True,
-    ) -> None:
-        bucket = cls._stage_bucket(stage)
-        if count_call:
-            bucket["self_attn_calls"] += 1
-            bucket[f"update_cache_{int(update_cache)}_calls"] += 1
-        bucket["new_tokens_total"] += int(new_tokens)
-        bucket["valid_tokens_total"] += int(valid_tokens)
-        bucket["evict_tokens_total"] += int(evict_tokens)
-        bucket["cache_capacity_tokens_max"] = max(bucket["cache_capacity_tokens_max"], int(cache_capacity))
-        if update_store_ms > 0.0:
-            bucket["kv_update_store_ms_total"] += float(update_store_ms)
-            bucket["kv_update_store_calls"] += 1
-        if gather_read_ms > 0.0:
-            bucket["kv_gather_read_ms_total"] += float(gather_read_ms)
-            bucket["kv_gather_read_calls"] += 1
-        if restore_ms > 0.0:
-            bucket["kv_restore_temp_ms_total"] += float(restore_ms)
-            bucket["kv_restore_temp_calls"] += 1
-
-    @classmethod
-    def pop_kv_bench_summary(cls) -> dict:
-        by_stage = cls._kv_bench_stats.get("by_stage", {})
-        out = {"stage": {}, "overall": {}}
-        overall = defaultdict(float)
-        for stage, bucket in by_stage.items():
-            row = dict(bucket)
-            calls = max(1, int(row.get("self_attn_calls", 0)))
-            row["avg_new_tokens"] = float(row["new_tokens_total"]) / calls
-            row["avg_valid_tokens"] = float(row["valid_tokens_total"]) / calls
-            row["avg_evict_tokens"] = float(row["evict_tokens_total"]) / calls
-            out["stage"][stage] = row
-            for k, v in row.items():
-                if k == "cache_capacity_tokens_max":
-                    overall[k] = max(overall[k], float(v))
-                elif isinstance(v, (int, float)):
-                    overall[k] += float(v)
-        o = dict(overall)
-        calls = max(1, int(o.get("self_attn_calls", 0)))
-        o["avg_new_tokens"] = float(o.get("new_tokens_total", 0.0)) / calls
-        o["avg_valid_tokens"] = float(o.get("valid_tokens_total", 0.0)) / calls
-        o["avg_evict_tokens"] = float(o.get("evict_tokens_total", 0.0)) / calls
-        out["overall"] = o
-        cls.reset_kv_bench_stats()
-        return out
-
-    @staticmethod
-    def _timed_ms(fn, device: torch.device, enabled: bool):
-        if not enabled:
-            return fn(), 0.0
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-            e0 = torch.cuda.Event(enable_timing=True)
-            e1 = torch.cuda.Event(enable_timing=True)
-            e0.record()
-            out = fn()
-            e1.record()
-            torch.cuda.synchronize(device)
-            return out, float(e0.elapsed_time(e1))
-        t0 = time.perf_counter()
-        out = fn()
-        return out, (time.perf_counter() - t0) * 1000.0
-
     def __init__(
         self,
         dim,
@@ -411,8 +299,6 @@ class WanAttention(torch.nn.Module):
         attn_mode='torch',
     ):
         super().__init__()
-        self._debug_kv_break = os.environ.get("DEBUG_KV_BREAK", "0") == "1"
-        self._debug_kv_break_max = int(os.environ.get("DEBUG_KV_BREAK_MAX", "1"))
         if attn_mode == 'torch':
             self.attn_op = custom_sdpa
         elif attn_mode == 'flashattn':
@@ -482,7 +368,6 @@ class WanAttention(torch.nn.Module):
         mask = cache["mask"]
         ids = cache["id"]
         free = (~mask).nonzero(as_tuple=False).squeeze(-1)
-        evict_count = 0
 
         if free.numel() < key_size:
             used = mask.nonzero(as_tuple=False).squeeze(-1)
@@ -491,14 +376,13 @@ class WanAttention(torch.nn.Module):
             order = torch.argsort(used_ids)
             need = key_size - free.numel()
             to_free = used[order[:need]]
-            evict_count = int(to_free.numel())
 
             mask[to_free] = False
             ids[to_free] = -1
             free = (~mask).nonzero(as_tuple=False).squeeze(-1)
 
         assert free.numel() >= key_size
-        return free[:key_size], evict_count
+        return free[:key_size]
 
     def _next_cache_id(self, cache_name):
         ids = self.attn_caches[cache_name]['id']
@@ -513,7 +397,7 @@ class WanAttention(torch.nn.Module):
         cache = self.attn_caches[cache_name]
 
         key_size = key.shape[1]
-        slots, evict_count = self.allocate_slots(cache_name, key_size)
+        slots = self.allocate_slots(cache_name, key_size)
 
         new_id = self._next_cache_id(cache_name)
 
@@ -522,7 +406,7 @@ class WanAttention(torch.nn.Module):
         cache['mask'][slots] = True
         cache['id'][slots] = new_id
         cache['is_pred'][slots] = is_pred
-        return slots, evict_count
+        return slots
 
     def restore_cache(self, cache_name, slots):
         self.attn_caches[cache_name]['mask'][slots] = False
@@ -535,7 +419,6 @@ class WanAttention(torch.nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
-        profile_stage='unknown',
     ):
         kv_cache = self.attn_caches[
             cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
@@ -556,70 +439,24 @@ class WanAttention(torch.nn.Module):
                 return x_out.to(x.dtype)
             query = apply_rotary_emb(query, rotary_emb)
             key = apply_rotary_emb(key, rotary_emb)
-        stage = str(profile_stage) if profile_stage is not None else "unknown"
-        kv_prof_enabled = bool(self._kv_bench_enabled) and (kv_cache is not None)
-
         slots = None
         if kv_cache is not None and kv_cache['k'] is not None:
-            key_tokens = int(key.shape[1])
-            (upd_out, update_store_ms) = self._timed_ms(
-                lambda: self.update_cache(
-                    cache_name,
-                    key,
-                    value,
-                    is_pred=(update_cache == 1),
-                ),
-                query.device,
-                kv_prof_enabled,
-            )
-            slots, evict_tokens = upd_out
+            slots = self.update_cache(cache_name,
+                                      key,
+                                      value,
+                                      is_pred=(update_cache == 1))
             key_pool = self.attn_caches[cache_name]['k']
             value_pool = self.attn_caches[cache_name]['v']
             mask = self.attn_caches[cache_name]['mask']
-            cache_capacity = int(mask.numel())
-
-            def _gather_valid_and_kv():
-                valid_local = mask.nonzero(as_tuple=False).squeeze(-1)
-                return valid_local, key_pool[:, valid_local], value_pool[:, valid_local]
-
-            (gather_out, gather_read_ms) = self._timed_ms(
-                _gather_valid_and_kv,
-                query.device,
-                kv_prof_enabled,
-            )
-            valid, key, value = gather_out
-            if kv_prof_enabled:
-                self._acc_kv_stat(
-                    stage=stage,
-                    update_cache=update_cache,
-                    new_tokens=key_tokens,
-                    valid_tokens=int(valid.numel()),
-                    evict_tokens=int(evict_tokens),
-                    cache_capacity=cache_capacity,
-                    update_store_ms=update_store_ms,
-                    gather_read_ms=gather_read_ms,
-                )
+            valid = mask.nonzero(as_tuple=False).squeeze(-1)
+            key = key_pool[:, valid]
+            value = value_pool[:, valid]
 
         hidden_states = self.attn_op(query, key, value)
 
         if update_cache == 0:
             if kv_cache is not None and kv_cache['k'] is not None:
-                _, restore_ms = self._timed_ms(
-                    lambda: self.restore_cache(cache_name, slots),
-                    query.device,
-                    kv_prof_enabled,
-                )
-                if kv_prof_enabled:
-                    self._acc_kv_stat(
-                        stage=stage,
-                        update_cache=update_cache,
-                        new_tokens=0,
-                        valid_tokens=0,
-                        evict_tokens=0,
-                        cache_capacity=0,
-                        restore_ms=restore_ms,
-                        count_call=False,
-                    )
+                self.restore_cache(cache_name, slots)
 
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -683,7 +520,6 @@ class WanTransformerBlock(nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
-        profile_stage='unknown',
     ) -> torch.Tensor:
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
@@ -703,8 +539,7 @@ class WanTransformerBlock(nn.Module):
                                  norm_hidden_states,
                                  rotary_emb,
                                  update_cache=update_cache,
-                                 cache_name=cache_name,
-                                 profile_stage=profile_stage)
+                                 cache_name=cache_name)
         hidden_states = (hidden_states.float() +
                          attn_output * gate_msa).type_as(hidden_states)
 
@@ -969,7 +804,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         cache_name="pos",
         action_mode=False,
         train_mode=False,
-        profile_stage='unknown',
     ):
         r"""
         Forward pass through the diffusion model
@@ -1029,8 +863,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                          timestep_proj,
                                          rotary_emb,
                                          update_cache=update_cache,
-                                         cache_name=cache_name,
-                                         profile_stage=profile_stage)
+                                         cache_name=cache_name)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)
@@ -1049,15 +882,6 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                              n=math.prod(self.patch_size))  #
 
         return latent_hidden_states
-
-    def set_kv_bench_enabled(self, enabled: bool) -> None:
-        WanAttention.set_kv_bench_enabled(enabled)
-
-    def reset_kv_bench_stats(self) -> None:
-        WanAttention.reset_kv_bench_stats()
-
-    def pop_kv_bench_summary(self) -> dict:
-        return WanAttention.pop_kv_bench_summary()
 
 
 if __name__ == '__main__':

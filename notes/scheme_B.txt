@@ -1,0 +1,74 @@
+  请按方案 B 实现 Lingbot-VA 的单-backbone block 量化接入。
+
+  先阅读以下文档：
+  1. /workspace/S/heguanhua2/wam/Model-Optimizer/docs/scheme_b/README.md
+  2. /workspace/S/heguanhua2/wam/Model-Optimizer/docs/scheme_b/CHECKLIST.md
+
+  目标：
+  - 保持单个 Lingbot-VA transformer backbone
+  - 只对 blocks.* 做 W8A16 风格的 INT8 weight-only quantization
+  - video_diffusion 前启用 *blocks.* quantizer
+  - action_diffusion 前禁用 *blocks.* quantizer
+  - 保持 self KV cache 单实例连续，不做双 backbone，不做 cache 同步
+
+  请重点查看并修改：
+  1. /workspace/S/heguanhua2/wam/lingbot-va/wan_va/modules/utils.py
+  2. /workspace/S/heguanhua2/wam/lingbot-va/wan_va/wan_va_server.py
+
+  重点函数：
+  - load_transformer(...)
+  - _infer_run_video_phase(...)
+  - _infer_run_action_phase(...)
+
+  实现要求：
+  1. 使用 modelopt.torch.quantization API
+     - mtq.quantize(...)
+     - mtq.enable_quantizer(...)
+     - mtq.disable_quantizer(...)
+     - 可选 mtq.print_quant_summary(...)
+
+  2. 新增 block-only selective quant config
+     - 默认全部 quantizer 关闭
+     - 只开启 *blocks.*weight_quantizer
+     - *blocks.*input_quantizer 保持关闭
+
+  3. 初始化阶段
+     - transformer 正常加载后，只执行一次 mtq.quantize(...)
+     - 量化插桩后默认先 disable_quantizer(self.transformer, "*blocks.*")
+     - 不要在每次请求或每个阶段重复 mtq.quantize(...)
+
+  4. 阶段切换
+     - video_diffusion 前 enable_quantizer(self.transformer, "*blocks.*")
+     - action_diffusion 前 disable_quantizer(self.transformer, "*blocks.*")
+
+  5. 保持非 block 模块不量化
+     - patch_embedding_mlp
+     - condition_embedder
+     - condition_embedder_action
+     - action_embedder
+     - proj_out
+     - action_proj_out
+
+  6. 不要实现双 backbone
+  7. 不要做 self KV cache 跨模型同步
+  8. 尽量只做最小范围修改
+  验收标准：
+  - Lingbot-VA 里始终只有一个 transformer 实例
+  - quantizer 主要只插到 blocks.*
+  - video -> action 连续运行时 self KV cache 不断
+  - video 路径走量化 block
+  - action 路径走 BF16 block
+  - 不出现 cache shape/dtype/key mismatch
+
+  如果需要调试，请保留最小日志：
+  - video 阶段切到 quant mode
+  - action 阶段切回 bf16 mode
+  - 可选输出一次 quant summary
+
+  完成后请汇报：
+  1. 改了哪些文件
+  2. 核心接入点在哪
+  3. quantizer 覆盖范围是否符合预期
+  4. video/action 连续调用是否通过
+  5. 还有哪些已知风险
+

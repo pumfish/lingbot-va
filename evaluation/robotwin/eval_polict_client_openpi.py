@@ -1,14 +1,12 @@
 import sys
 import os
 import subprocess
-import time
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-# robowin_root = Path("/path/to/your/robowin")
-robowin_root = Path("/workspace/S/heguanhua2/wam/lingbot-va/RoboTwin")
+robowin_root = Path("/path/to/your/robowin")
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -44,249 +42,6 @@ from pathlib import Path
 
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 from evaluation.robotwin.test_render import Sapien_TEST
-
-_FFMPEG_VIDEO_ENCODE_ARGS = None
-
-DEBUG_IO = os.environ.get("DEBUG_IO", "0") == "1"
-DEBUG_IO_PRINT_LIMIT = int(os.environ.get("DEBUG_IO_PRINT_LIMIT", "200"))
-
-
-def _append_latency(stats: dict, key: str, val: float) -> None:
-    stats.setdefault(key, []).append(float(val))
-
-
-MODULE_LATENCY_KEYS = [
-    "obs_preprocess",
-    "vae_to_latent",
-    "text_encoder",
-    "kv_prefill",
-    "video_diffusion",
-    "action_diffusion",
-    "action_postprocess",
-]
-
-STEP_LATENCY_KEYS = [
-    "video_denoise_step_ms",
-    "action_denoise_step_ms",
-]
-
-KV_TIMING_KEYS = [
-    "kv_prepare_input_ms",
-    "kv_prefill_latent_forward_ms",
-    "kv_prefill_action_forward_ms",
-    "kv_prefill_total_forward_ms",
-    "kv_update_store_ms_total",
-    "kv_gather_read_ms_total",
-    "kv_restore_temp_ms_total",
-    "self_attn_calls",
-    "update_cache_0_calls",
-    "update_cache_1_calls",
-    "update_cache_2_calls",
-    "avg_new_tokens",
-    "avg_valid_tokens",
-    "avg_evict_tokens",
-    "video_diffusion_kv_update_store_ms_total",
-    "video_diffusion_kv_gather_read_ms_total",
-    "video_diffusion_kv_restore_temp_ms_total",
-    "action_diffusion_kv_update_store_ms_total",
-    "action_diffusion_kv_gather_read_ms_total",
-    "action_diffusion_kv_restore_temp_ms_total",
-    "kv_prefill_latent_kv_update_store_ms_total",
-    "kv_prefill_latent_kv_gather_read_ms_total",
-    "kv_prefill_latent_kv_restore_temp_ms_total",
-    "kv_prefill_action_kv_update_store_ms_total",
-    "kv_prefill_action_kv_gather_read_ms_total",
-    "kv_prefill_action_kv_restore_temp_ms_total",
-]
-
-
-def _append_module_latency(module_stats: dict, resp: dict | None) -> None:
-    if not isinstance(resp, dict):
-        return
-    block = resp.get("module_timing", None)
-    if not isinstance(block, dict):
-        return
-    for k, v in block.items():
-        if k in MODULE_LATENCY_KEYS and v is not None:
-            module_stats.setdefault(k, []).append(float(v))
-
-
-def _append_step_latency(step_stats: dict, resp: dict | None) -> None:
-    if not isinstance(resp, dict):
-        return
-    block = resp.get("step_timing", None)
-    if not isinstance(block, dict):
-        return
-    for k in STEP_LATENCY_KEYS:
-        vals = block.get(k, None)
-        if not isinstance(vals, list):
-            continue
-        for v in vals:
-            if v is None:
-                continue
-            step_stats.setdefault(k, []).append(float(v))
-
-
-def _append_kv_scalar(stats: dict, key: str, val) -> None:
-    if val is None:
-        return
-    try:
-        stats.setdefault(key, []).append(float(val))
-    except (TypeError, ValueError):
-        return
-
-
-def _append_kv_timing(kv_stats: dict, resp: dict | None) -> None:
-    if not isinstance(resp, dict):
-        return
-    block = resp.get("kv_timing", None)
-    if not isinstance(block, dict):
-        return
-
-    for k in [
-        "kv_prepare_input_ms",
-        "kv_prefill_latent_forward_ms",
-        "kv_prefill_action_forward_ms",
-        "kv_prefill_total_forward_ms",
-    ]:
-        _append_kv_scalar(kv_stats, k, block.get(k, None))
-
-    attn_cache = block.get("attn_cache", None)
-    if not isinstance(attn_cache, dict):
-        return
-
-    overall = attn_cache.get("overall", {})
-    if isinstance(overall, dict):
-        for k in [
-            "kv_update_store_ms_total",
-            "kv_gather_read_ms_total",
-            "kv_restore_temp_ms_total",
-            "self_attn_calls",
-            "update_cache_0_calls",
-            "update_cache_1_calls",
-            "update_cache_2_calls",
-            "avg_new_tokens",
-            "avg_valid_tokens",
-            "avg_evict_tokens",
-        ]:
-            _append_kv_scalar(kv_stats, k, overall.get(k, None))
-
-    stage = attn_cache.get("stage", {})
-    if not isinstance(stage, dict):
-        return
-    stage_alias = [
-        ("video_diffusion", "video_diffusion"),
-        ("action_diffusion", "action_diffusion"),
-        ("kv_prefill_latent", "kv_prefill_latent"),
-        ("kv_prefill_action", "kv_prefill_action"),
-    ]
-    for raw_name, prefix in stage_alias:
-        row = stage.get(raw_name, None)
-        if not isinstance(row, dict):
-            continue
-        for src in ["kv_update_store_ms_total", "kv_gather_read_ms_total", "kv_restore_temp_ms_total"]:
-            _append_kv_scalar(kv_stats, f"{prefix}_{src}", row.get(src, None))
-
-
-def _latency_summary(values):
-    if not values:
-        return {
-            "count": 0,
-            "total": 0.0,
-            "mean": None,
-            "p50": None,
-            "p90": None,
-            "p99": None,
-        }
-    arr = np.array(values, dtype=np.float64)
-    return {
-        "count": int(arr.size),
-        "total": float(arr.sum()),
-        "mean": float(arr.mean()),
-        "p50": float(np.percentile(arr, 50)),
-        "p90": float(np.percentile(arr, 90)),
-        "p99": float(np.percentile(arr, 99)),
-    }
-
-
-def _build_latency_report(
-    stats: dict,
-    module_stats: dict | None = None,
-    step_stats: dict | None = None,
-    kv_stats: dict | None = None,
-):
-    report = {
-        "episode_e2e_sec": _latency_summary(stats.get("episode_e2e_sec", [])),
-        "rpc_reset_sec": _latency_summary(stats.get("rpc_reset_sec", [])),
-        "rpc_infer_sec": _latency_summary(stats.get("rpc_infer_sec", [])),
-        "rpc_kv_sec": _latency_summary(stats.get("rpc_kv_sec", [])),
-    }
-    module_stats = module_stats or {}
-    step_stats = step_stats or {}
-    kv_stats = kv_stats or {}
-    report["module_latency_ms"] = {k: _latency_summary(module_stats.get(k, [])) for k in MODULE_LATENCY_KEYS}
-    report["step_latency_ms"] = {k: _latency_summary(step_stats.get(k, [])) for k in STEP_LATENCY_KEYS}
-    report["kv_timing_ms"] = {k: _latency_summary(kv_stats.get(k, [])) for k in KV_TIMING_KEYS}
-
-    module = report["module_latency_ms"]
-    kv = report["kv_timing_ms"]
-    diffusion_total_ms = float(module.get("video_diffusion", {}).get("total", 0.0) or 0.0) + float(module.get("action_diffusion", {}).get("total", 0.0) or 0.0)
-    kv_strict_ms = float(kv.get("kv_update_store_ms_total", {}).get("total", 0.0) or 0.0) + float(kv.get("kv_gather_read_ms_total", {}).get("total", 0.0) or 0.0) + float(kv.get("kv_restore_temp_ms_total", {}).get("total", 0.0) or 0.0)
-    kv_with_prefill_ms = kv_strict_ms + float(kv.get("kv_prefill_total_forward_ms", {}).get("total", 0.0) or 0.0)
-    e2e_total_ms = float(report.get("episode_e2e_sec", {}).get("total", 0.0) or 0.0) * 1000.0
-
-    report["kv_ratio"] = {
-        "kv_strict_over_diffusion": (kv_strict_ms / diffusion_total_ms) if diffusion_total_ms > 0 else None,
-        "kv_with_prefill_over_diffusion": (kv_with_prefill_ms / diffusion_total_ms) if diffusion_total_ms > 0 else None,
-        "kv_strict_over_e2e": (kv_strict_ms / e2e_total_ms) if e2e_total_ms > 0 else None,
-        "kv_with_prefill_over_e2e": (kv_with_prefill_ms / e2e_total_ms) if e2e_total_ms > 0 else None,
-        "kv_strict_total_ms": kv_strict_ms,
-        "kv_with_prefill_total_ms": kv_with_prefill_ms,
-        "diffusion_total_ms": diffusion_total_ms,
-        "episode_e2e_total_ms": e2e_total_ms,
-    }
-    return report
-
-
-def _get_ffmpeg_video_encode_args():
-    """Pick H.264-style args; many minimal ffmpeg builds omit libx264 (GPL)."""
-    global _FFMPEG_VIDEO_ENCODE_ARGS
-    if _FFMPEG_VIDEO_ENCODE_ARGS is not None:
-        return _FFMPEG_VIDEO_ENCODE_ARGS
-
-    override = os.environ.get("EVAL_FFMPEG_VCODEC", "").strip()
-    if override == "libx264":
-        _FFMPEG_VIDEO_ENCODE_ARGS = ["-vcodec", "libx264", "-crf", "23"]
-        return _FFMPEG_VIDEO_ENCODE_ARGS
-    if override == "h264_nvenc":
-        _FFMPEG_VIDEO_ENCODE_ARGS = ["-vcodec", "h264_nvenc", "-cq", "23"]
-        return _FFMPEG_VIDEO_ENCODE_ARGS
-    if override == "mpeg4":
-        _FFMPEG_VIDEO_ENCODE_ARGS = ["-vcodec", "mpeg4", "-q:v", "5"]
-        return _FFMPEG_VIDEO_ENCODE_ARGS
-    if override:
-        _FFMPEG_VIDEO_ENCODE_ARGS = ["-vcodec", override]
-        return _FFMPEG_VIDEO_ENCODE_ARGS
-
-    try:
-        proc = subprocess.run(
-            ["ffmpeg", "-hide_banner", "-encoders"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        blob = (proc.stdout or "") + (proc.stderr or "")
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        blob = ""
-
-    if "libx264" in blob:
-        _FFMPEG_VIDEO_ENCODE_ARGS = ["-vcodec", "libx264", "-crf", "23"]
-    elif "h264_nvenc" in blob:
-        _FFMPEG_VIDEO_ENCODE_ARGS = ["-vcodec", "h264_nvenc", "-cq", "23"]
-    else:
-        _FFMPEG_VIDEO_ENCODE_ARGS = ["-vcodec", "mpeg4", "-q:v", "5"]
-    return _FFMPEG_VIDEO_ENCODE_ARGS
-
 
 def write_json(data: dict, fpath: Path) -> None:
     """Write data to a JSON file.
@@ -547,7 +302,6 @@ def main(usr_args):
     task_config = usr_args["task_config"]
     ckpt_setting = usr_args["ckpt_setting"]
     save_root = usr_args["save_root"]
-    save_native_eval_result = bool(usr_args.get("save_native_eval_result", False))
     policy_name = usr_args["policy_name"]
     video_guidance_scale = usr_args["video_guidance_scale"]
     action_guidance_scale = usr_args["action_guidance_scale"]
@@ -603,20 +357,15 @@ def main(usr_args):
     else:
         embodiment_name = str(embodiment_type[0]) + "+" + str(embodiment_type[1])
 
-    # Native RoboTwin eval_result output is optional. For storage saving, default is disabled.
-    if save_native_eval_result:
-        save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
-        save_dir.mkdir(parents=True, exist_ok=True)
+    save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
+    save_dir.mkdir(parents=True, exist_ok=True)
 
-    if args["eval_video_log"] and save_native_eval_result:
+    if args["eval_video_log"]:
         video_save_dir = save_dir
         camera_config = get_camera_config(args["camera"]["head_camera_type"])
         video_size = str(camera_config["w"]) + "x" + str(camera_config["h"])
         video_save_dir.mkdir(parents=True, exist_ok=True)
         args["eval_video_save_dir"] = video_save_dir
-    else:
-        args["eval_video_log"] = False
-        args.pop("eval_video_save_dir", None)
 
     print("============= Config =============\n")
     print("\033[95mMessy Table:\033[0m " + str(args["domain_randomization"]["cluttered_table"]))
@@ -638,7 +387,6 @@ def main(usr_args):
 
     TASK_ENV = class_decorator(args["task_name"])
     args["policy_name"] = policy_name
-    args["save_native_eval_result"] = save_native_eval_result
     usr_args["left_arm_dim"] = len(args["left_embodiment_config"]["arm_joints_name"][0])
     usr_args["right_arm_dim"] = len(args["right_embodiment_config"]["arm_joints_name"][1])
 
@@ -664,15 +412,13 @@ def main(usr_args):
                                    action_guidance_scale=action_guidance_scale)
     suc_nums.append(suc_num)
 
-    report_dir = Path(save_root) / "run_reports"
-    report_dir.mkdir(parents=True, exist_ok=True)
-    report_file = report_dir / f"result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-    with open(report_file, "w") as file:
+    file_path = os.path.join(save_dir, f"_result.txt")
+    with open(file_path, "w") as file:
         file.write(f"Timestamp: {current_time}\n\n")
         file.write(f"Instruction Type: {instruction_type}\n\n")
         file.write("\n".join(map(str, np.array(suc_nums) / test_num)))
 
-    print(f"Data has been saved to {report_file}")
+    print(f"Data has been saved to {file_path}")
 
 def format_obs(observation, prompt):
     return {
@@ -720,16 +466,6 @@ def eval_policy(task_name,
 
     now_seed = st_seed
     clear_cache_freq = args["clear_cache_freq"]
-    latency_stats = {
-        "episode_e2e_sec": [],
-        "rpc_reset_sec": [],
-        "rpc_infer_sec": [],
-        "rpc_kv_sec": [],
-    }
-    module_latency_stats = {k: [] for k in MODULE_LATENCY_KEYS}
-    step_latency_stats = {k: [] for k in STEP_LATENCY_KEYS}
-    kv_timing_stats = {k: [] for k in KV_TIMING_KEYS}
-    debug_io_count = 0
 
     args["eval_mode"] = True
 
@@ -771,11 +507,7 @@ def eval_policy(task_name,
         instruction = np.random.choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
-        if not args.get("save_native_eval_result", False):
-            TASK_ENV.eval_video_path = None
-
         if TASK_ENV.eval_video_path is not None:
-            vcodec_args = _get_ffmpeg_video_encode_args()
             ffmpeg = subprocess.Popen(
                 [
                     "ffmpeg",
@@ -794,7 +526,10 @@ def eval_policy(task_name,
                     "-",
                     "-pix_fmt",
                     "yuv420p",
-                    *vcodec_args,
+                    "-vcodec",
+                    "libx264",
+                    "-crf",
+                    "23",
                     f"{TASK_ENV.eval_video_path}/episode{TASK_ENV.test_num}.mp4",
                 ],
                 stdin=subprocess.PIPE,
@@ -803,14 +538,8 @@ def eval_policy(task_name,
 
         succ = False
 
-        episode_t0 = time.perf_counter()
         prompt = TASK_ENV.get_instruction()
-        rpc_t0 = time.perf_counter()
         ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
-        _append_latency(latency_stats, "rpc_reset_sec", time.perf_counter() - rpc_t0)
-        _append_module_latency(module_latency_stats, ret)
-        _append_step_latency(step_latency_stats, ret)
-        _append_kv_timing(kv_timing_stats, ret)
         
         first = True
         full_obs_list = []
@@ -830,25 +559,9 @@ def eval_policy(task_name,
             if first:
                 observation = TASK_ENV.get_obs()
                 first_obs = format_obs(observation, prompt)
-                if DEBUG_IO and debug_io_count < DEBUG_IO_PRINT_LIMIT:
-                    print(f"[DEBUG_IO] first_obs cam_high={first_obs['observation.images.cam_high'].shape} "
-                          f"left={first_obs['observation.images.cam_left_wrist'].shape} "
-                          f"right={first_obs['observation.images.cam_right_wrist'].shape} "
-                          f"state={first_obs['observation.state'].shape}")
-                    debug_io_count += 1
 
-            rpc_t0 = time.perf_counter()
             ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
-            _append_latency(latency_stats, "rpc_infer_sec", time.perf_counter() - rpc_t0)
-            _append_module_latency(module_latency_stats, ret)
-            _append_step_latency(step_latency_stats, ret)
-            _append_kv_timing(kv_timing_stats, ret)
             action = ret['action']
-            if DEBUG_IO and debug_io_count < DEBUG_IO_PRINT_LIMIT:
-                print(f"[DEBUG_IO] action shape={action.shape} min={float(action.min()):.4f} "
-                      f"max={float(action.max()):.4f} mean={float(action.mean()):.4f} "
-                      f"sample={action[:, 0, 0][:8]}")
-                debug_io_count += 1
             if 'video' in ret:
                 imagined_video = ret['video']
                 gen_video_list.append(imagined_video)
@@ -892,16 +605,7 @@ def eval_policy(task_name,
                     
             first = False
 
-            rpc_t0 = time.perf_counter()
-            ret_kv = model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
-            _append_latency(latency_stats, "rpc_kv_sec", time.perf_counter() - rpc_t0)
-            _append_module_latency(module_latency_stats, ret_kv)
-            _append_step_latency(step_latency_stats, ret_kv)
-            _append_kv_timing(kv_timing_stats, ret_kv)
-            if DEBUG_IO and debug_io_count < DEBUG_IO_PRINT_LIMIT:
-                mt = ret_kv.get('module_timing', {}) if isinstance(ret_kv, dict) else {}
-                print(f"[DEBUG_IO] kv_return module_timing_keys={list(mt.keys())}")
-                debug_io_count += 1
+            model.infer(dict(obs = key_frame_list, compute_kv_cache=True, imagine=False, save_visualization=save_visualization, state=action))
   
             if TASK_ENV.eval_success:
                 succ = True
@@ -935,7 +639,6 @@ def eval_policy(task_name,
             TASK_ENV.viewer.close()
 
         TASK_ENV.test_num += 1
-        _append_latency(latency_stats, "episode_e2e_sec", time.perf_counter() - episode_t0)
 
         save_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'metrics' / task_name
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -945,8 +648,6 @@ def eval_policy(task_name,
           "total_num": float(TASK_ENV.test_num),
           "succ_rate": float(TASK_ENV.suc / TASK_ENV.test_num),
         }, out_json_file)
-        latency_json_file = save_dir / "latency.json"
-        write_json(_build_latency_report(latency_stats, module_latency_stats, step_latency_stats, kv_timing_stats), latency_json_file)
         
         print(
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
@@ -966,8 +667,6 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
-    parser.add_argument("--save_native_eval_result", action="store_true",
-                        help="keep RoboTwin native eval_result video output (default: disabled to save space)")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
