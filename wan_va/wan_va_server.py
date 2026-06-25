@@ -677,8 +677,12 @@ def run(args):
     
     config = VA_CONFIGS[args.config_name]
     port = config.port if args.port is None else args.port
+    if args.model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.model_path
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.enable_offload is not None:
+        config.enable_offload = bool(args.enable_offload)
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -713,6 +717,18 @@ def main():
         type=int,
         default=None,
         help='(start) port'
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help='override model path'
+    )
+    parser.add_argument(
+        "--enable_offload",
+        type=int,
+        default=None,
+        help='set 1 to offload VAE/text encoder to CPU, 0 to keep them on GPU'
     )
     parser.add_argument(
         "--save_root",

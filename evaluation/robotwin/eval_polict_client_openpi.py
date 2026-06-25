@@ -6,7 +6,11 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import cv2
 from pathlib import Path
 
-robowin_root = Path("/path/to/your/robowin")
+robowin_root = Path(
+    os.environ.get(
+        "ROBOTWIN_ROOT",
+        str(Path(__file__).resolve().parents[2] / "RoboTwin"),
+    ))
 if str(robowin_root) not in sys.path:
     sys.path.insert(0, str(robowin_root))
 
@@ -407,7 +411,7 @@ def main(usr_args):
                                    test_num=test_num,
                                    video_size=video_size,
                                    instruction_type=instruction_type,
-                                   save_visualization=True,
+                                   save_visualization=bool(usr_args.get("save_visualization", False)),
                                    video_guidance_scale=video_guidance_scale,
                                    action_guidance_scale=action_guidance_scale)
     suc_nums.append(suc_num)
@@ -667,6 +671,7 @@ def parse_args_and_config():
     parser.add_argument("--video_guidance_scale", type=float, default=5.0)
     parser.add_argument("--action_guidance_scale", type=float, default=5.0)
     parser.add_argument("--test_num", type=int, default=100)
+    parser.add_argument("--save_visualization", type=int, default=0)
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -697,4 +702,3 @@ if __name__ == "__main__":
     Sapien_TEST()
     usr_args = parse_args_and_config()
     main(usr_args)
-
