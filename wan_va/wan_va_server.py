@@ -20,6 +20,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model
 from distributed.util import _configure_model, init_distributed
+from modules.modelopt_checkpoint import restore_modelopt_checkpoint
 from modules.utils import (
     WanVAEStreamingWrapper,
     load_text_encoder,
@@ -83,6 +84,18 @@ class VA_Server:
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
+        self.modelopt_restore_from = getattr(job_config, 'modelopt_restore_from', None)
+        self._modelopt_quantizers = []
+        if self.modelopt_restore_from:
+            self._modelopt_quantizers = restore_modelopt_checkpoint(
+                self.transformer,
+                self.modelopt_restore_from,
+            )
+            logger.info(
+                "Restored ModelOpt checkpoint %s with %d enabled quantizers.",
+                self.modelopt_restore_from,
+                len(self._modelopt_quantizers),
+            )
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
@@ -683,6 +696,8 @@ def run(args):
         config.save_root = args.save_root
     if args.enable_offload is not None:
         config.enable_offload = bool(args.enable_offload)
+    if args.modelopt_restore_from is not None:
+        config.modelopt_restore_from = args.modelopt_restore_from
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -729,6 +744,12 @@ def main():
         type=int,
         default=None,
         help='set 1 to offload VAE/text encoder to CPU, 0 to keep them on GPU'
+    )
+    parser.add_argument(
+        "--modelopt_restore_from",
+        type=str,
+        default=None,
+        help='path to a ModelOpt checkpoint restored before FSDP sharding',
     )
     parser.add_argument(
         "--save_root",
