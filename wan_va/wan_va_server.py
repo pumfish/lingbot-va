@@ -20,6 +20,9 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model
 from distributed.util import _configure_model, init_distributed
+from modules.duquant_checkpoint import restore_wan_duquant_checkpoint
+from modules.modelopt_checkpoint import restore_modelopt_checkpoint
+from modules.omega_qvla_controller import OmegaQVLAOfflinePackController
 from modules.utils import (
     WanVAEStreamingWrapper,
     load_text_encoder,
@@ -83,6 +86,39 @@ class VA_Server:
             torch_dtype=self.dtype,
             torch_device=self.device,
         )
+        self.modelopt_restore_from = getattr(job_config, 'modelopt_restore_from', None)
+        self.duquant_restore_from = getattr(job_config, 'duquant_restore_from', None)
+        if self.modelopt_restore_from and self.duquant_restore_from:
+            raise ValueError(
+                "--modelopt_restore_from and --duquant_restore_from are mutually exclusive"
+            )
+        self._modelopt_quantizers = []
+        if self.modelopt_restore_from:
+            self._modelopt_quantizers = restore_modelopt_checkpoint(
+                self.transformer,
+                self.modelopt_restore_from,
+            )
+            logger.info(
+                "Restored ModelOpt checkpoint %s with %d enabled quantizers.",
+                self.modelopt_restore_from,
+                len(self._modelopt_quantizers),
+            )
+        elif self.duquant_restore_from:
+            block_size = getattr(job_config, 'duquant_rotation_block_size', 128)
+            permutation_times = getattr(job_config, 'duquant_permutation_times', 1)
+            duquant_restore = restore_wan_duquant_checkpoint(
+                self.transformer,
+                self.duquant_restore_from,
+                block_size=block_size,
+                permutation_times=permutation_times,
+            )
+            self._modelopt_quantizers = list(duquant_restore.enabled_quantizers)
+            logger.info(
+                "Restored DuQuant checkpoint %s with %d targets and %d enabled quantizers.",
+                self.duquant_restore_from,
+                len(duquant_restore.targets),
+                len(self._modelopt_quantizers),
+            )
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
@@ -90,6 +126,22 @@ class VA_Server:
                                             device=self.device,
                                             eval_mode=True,
                                             )
+        self.omega_qvla_pack = getattr(job_config, 'omega_qvla_pack', None)
+        self.omega_qvla_branches = getattr(job_config, 'omega_qvla_branches', 'both')
+        self.ours_mixed_policy = getattr(job_config, 'ours_mixed_policy', None)
+        self._omega_qvla_controller = None
+        if self.omega_qvla_pack:
+            self._omega_qvla_controller = OmegaQVLAOfflinePackController(
+                self.transformer,
+                self.omega_qvla_pack,
+                quantized_branches=self.omega_qvla_branches,
+                mixed_policy_path=self.ours_mixed_policy,
+            )
+            logger.info(
+                "Attached Omega-QVLA pack to %d Linear targets; branches=%s.",
+                len(self._omega_qvla_controller.target_names),
+                self.omega_qvla_branches,
+            )
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
@@ -497,6 +549,7 @@ class VA_Server:
                     latent_cond,
                     None,
                     frame_st_id=frame_st_id)
+                self._activate_omega_qvla("latent", i)
 
                 video_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['latent_res_lst']),
@@ -538,6 +591,7 @@ class VA_Server:
                     None,
                     action_cond,
                     frame_st_id=frame_st_id)
+                self._activate_omega_qvla("action", i)
                 action_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['action_res_lst']),
                     update_cache=1 if last_step else 0,
@@ -558,6 +612,8 @@ class VA_Server:
                                                          return_dict=False)
 
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+
+        self._deactivate_omega_qvla()
 
         actions[:, ~self.action_mask] *= 0
 
@@ -587,6 +643,7 @@ class VA_Server:
                                                 action_model_input,
                                                 frame_st_id=self.frame_st_id)
 
+        self._deactivate_omega_qvla()
         with (
                 torch.no_grad(),
         ):
@@ -601,6 +658,14 @@ class VA_Server:
                              action_mode=True)
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
+
+    def _activate_omega_qvla(self, branch, denoise_step):
+        if self._omega_qvla_controller is not None:
+            self._omega_qvla_controller.activate(branch, denoise_step)
+
+    def _deactivate_omega_qvla(self):
+        if self._omega_qvla_controller is not None:
+            self._omega_qvla_controller.deactivate()
 
     @torch.no_grad()
     def infer(self, obs):
@@ -677,8 +742,24 @@ def run(args):
     
     config = VA_CONFIGS[args.config_name]
     port = config.port if args.port is None else args.port
+    if args.model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.model_path
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.enable_offload is not None:
+        config.enable_offload = bool(args.enable_offload)
+    if args.modelopt_restore_from is not None:
+        config.modelopt_restore_from = args.modelopt_restore_from
+    if args.duquant_restore_from is not None:
+        config.duquant_restore_from = args.duquant_restore_from
+        config.duquant_rotation_block_size = args.duquant_rotation_block_size
+        config.duquant_permutation_times = args.duquant_permutation_times
+    if args.omega_qvla_pack is not None:
+        config.omega_qvla_pack = args.omega_qvla_pack
+    if args.omega_qvla_branches is not None:
+        config.omega_qvla_branches = args.omega_qvla_branches
+    if args.ours_mixed_policy is not None:
+        config.ours_mixed_policy = args.ours_mixed_policy
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -713,6 +794,60 @@ def main():
         type=int,
         default=None,
         help='(start) port'
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=None,
+        help='override model path'
+    )
+    parser.add_argument(
+        "--enable_offload",
+        type=int,
+        default=None,
+        help='set 1 to offload VAE/text encoder to CPU, 0 to keep them on GPU'
+    )
+    parser.add_argument(
+        "--modelopt_restore_from",
+        type=str,
+        default=None,
+        help='path to a ModelOpt checkpoint restored before FSDP sharding',
+    )
+    parser.add_argument(
+        "--duquant_restore_from",
+        type=str,
+        default=None,
+        help='path to a DuQuant ModelOpt checkpoint restored before FSDP sharding',
+    )
+    parser.add_argument(
+        "--duquant_rotation_block_size",
+        type=int,
+        default=128,
+        help='DuQuant rotation block size stored by the checkpoint topology',
+    )
+    parser.add_argument(
+        "--duquant_permutation_times",
+        type=int,
+        default=1,
+        help='number of DuQuant permutations stored by the checkpoint topology',
+    )
+    parser.add_argument(
+        "--omega_qvla_pack",
+        type=str,
+        default=None,
+        help='path to an offline Omega-QVLA rank-0 RTN pack',
+    )
+    parser.add_argument(
+        "--omega_qvla_branches",
+        choices=("both", "latent", "action"),
+        default=None,
+        help='generation branches quantized by the Omega-QVLA pack',
+    )
+    parser.add_argument(
+        "--ours_mixed_policy",
+        type=str,
+        default=None,
+        help='all-MDP dual-branch A4/A8 policy for online token-group Amax Q/DQ',
     )
     parser.add_argument(
         "--save_root",
