@@ -20,6 +20,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from configs import VA_CONFIGS
 from distributed.fsdp import shard_model
 from distributed.util import _configure_model, init_distributed
+from modules.duquant_checkpoint import restore_wan_duquant_checkpoint
 from modules.modelopt_checkpoint import restore_modelopt_checkpoint
 from modules.omega_qvla_controller import OmegaQVLAOfflinePackController
 from modules.utils import (
@@ -86,6 +87,11 @@ class VA_Server:
             torch_device=self.device,
         )
         self.modelopt_restore_from = getattr(job_config, 'modelopt_restore_from', None)
+        self.duquant_restore_from = getattr(job_config, 'duquant_restore_from', None)
+        if self.modelopt_restore_from and self.duquant_restore_from:
+            raise ValueError(
+                "--modelopt_restore_from and --duquant_restore_from are mutually exclusive"
+            )
         self._modelopt_quantizers = []
         if self.modelopt_restore_from:
             self._modelopt_quantizers = restore_modelopt_checkpoint(
@@ -95,6 +101,22 @@ class VA_Server:
             logger.info(
                 "Restored ModelOpt checkpoint %s with %d enabled quantizers.",
                 self.modelopt_restore_from,
+                len(self._modelopt_quantizers),
+            )
+        elif self.duquant_restore_from:
+            block_size = getattr(job_config, 'duquant_rotation_block_size', 128)
+            permutation_times = getattr(job_config, 'duquant_permutation_times', 1)
+            duquant_restore = restore_wan_duquant_checkpoint(
+                self.transformer,
+                self.duquant_restore_from,
+                block_size=block_size,
+                permutation_times=permutation_times,
+            )
+            self._modelopt_quantizers = list(duquant_restore.enabled_quantizers)
+            logger.info(
+                "Restored DuQuant checkpoint %s with %d targets and %d enabled quantizers.",
+                self.duquant_restore_from,
+                len(duquant_restore.targets),
                 len(self._modelopt_quantizers),
             )
         shard_fn = shard_model
@@ -728,6 +750,10 @@ def run(args):
         config.enable_offload = bool(args.enable_offload)
     if args.modelopt_restore_from is not None:
         config.modelopt_restore_from = args.modelopt_restore_from
+    if args.duquant_restore_from is not None:
+        config.duquant_restore_from = args.duquant_restore_from
+        config.duquant_rotation_block_size = args.duquant_rotation_block_size
+        config.duquant_permutation_times = args.duquant_permutation_times
     if args.omega_qvla_pack is not None:
         config.omega_qvla_pack = args.omega_qvla_pack
     if args.omega_qvla_branches is not None:
@@ -786,6 +812,24 @@ def main():
         type=str,
         default=None,
         help='path to a ModelOpt checkpoint restored before FSDP sharding',
+    )
+    parser.add_argument(
+        "--duquant_restore_from",
+        type=str,
+        default=None,
+        help='path to a DuQuant ModelOpt checkpoint restored before FSDP sharding',
+    )
+    parser.add_argument(
+        "--duquant_rotation_block_size",
+        type=int,
+        default=128,
+        help='DuQuant rotation block size stored by the checkpoint topology',
+    )
+    parser.add_argument(
+        "--duquant_permutation_times",
+        type=int,
+        default=1,
+        help='number of DuQuant permutations stored by the checkpoint topology',
     )
     parser.add_argument(
         "--omega_qvla_pack",

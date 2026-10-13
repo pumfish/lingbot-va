@@ -51,6 +51,31 @@ def test_server_launcher_omits_checkpoint_argument_when_not_configured(tmp_path)
     assert "--modelopt_restore_from" not in result.stdout
 
 
+def test_server_launcher_forwards_optional_duquant_checkpoint(tmp_path):
+    checkpoint = tmp_path / "duquant.pt"
+    environment = os.environ | {
+        "SERVER_PYTHON": "/bin/echo",
+        "SAVE_ROOT": str(tmp_path / "results"),
+        "MODEL_PATH": "/models/lingbot-va",
+        "DUQUANT_RESTORE_FROM": str(checkpoint),
+        "DUQUANT_ROTATION_BLOCK_SIZE": "64",
+        "DUQUANT_PERMUTATION_TIMES": "2",
+    }
+
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert f"--duquant_restore_from {checkpoint}" in result.stdout
+    assert "--duquant_rotation_block_size 64" in result.stdout
+    assert "--duquant_permutation_times 2" in result.stdout
+
+
 def test_server_launcher_forwards_optional_omega_pack(tmp_path):
     pack = tmp_path / "omega.pt"
     environment = os.environ | {
