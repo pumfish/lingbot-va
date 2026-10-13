@@ -70,6 +70,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--duquant-rotation-block-size", type=int, default=128)
     parser.add_argument("--duquant-permutation-times", type=int, default=1)
     parser.add_argument("--robotwin-root")
+    parser.add_argument("--task-seeds", help="Explicit paired RoboTwin task seeds.")
+    parser.add_argument("--task-episode-ids", help="Explicit RoboTwin episode indices.")
+    parser.add_argument("--frozen-episodes", help="JSONL containing paired seeds and instructions.")
+    parser.add_argument(
+        "--resume-metrics",
+        help="Metrics directory containing episode_results.jsonl.",
+    )
     parser.add_argument("--server-python", default=sys.executable)
     parser.add_argument("--server-start-timeout", type=int, default=420)
     parser.add_argument("--dry-run", action="store_true")
@@ -151,6 +158,15 @@ def main() -> int:
     client_environment = os.environ.copy()
     if args.robotwin_root:
         client_environment["ROBOTWIN_ROOT"] = args.robotwin_root
+    evaluation_environment = {
+        "ROBOTWIN_TASK_SEEDS": args.task_seeds,
+        "ROBOTWIN_TASK_EPISODE_IDS": args.task_episode_ids,
+        "ROBOTWIN_FROZEN_EPISODES_JSONL": args.frozen_episodes,
+        "ROBOTWIN_RESUME_METRICS": args.resume_metrics,
+    }
+    client_environment.update(
+        {name: value for name, value in evaluation_environment.items() if value}
+    )
 
     print(f"[robotwin-task] method={args.method} task={args.task} episodes={args.episodes}")
     print(f"[robotwin-task] server={shlex.join(server_command)}")
@@ -158,6 +174,9 @@ def main() -> int:
     if args.dry_run:
         for name in sorted(method_environment):
             print(f"[robotwin-task] env {name}={method_environment[name]}")
+        for name in sorted(evaluation_environment):
+            if evaluation_environment[name]:
+                print(f"[robotwin-task] env {name}={evaluation_environment[name]}")
         return 0
 
     for directory in (server_root, client_root, logs_root):

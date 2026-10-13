@@ -12,8 +12,10 @@ RUNNER = REPOSITORY_ROOT / "experiments/run_robotwin_task.py"
 def test_dry_run_resolves_ours_and_prints_server_and_client_commands(tmp_path):
     pack = tmp_path / "omega.pt"
     policy = tmp_path / "policy.json"
+    frozen = tmp_path / "frozen.jsonl"
     pack.touch()
     policy.touch()
+    frozen.touch()
 
     result = subprocess.run(
         [
@@ -33,6 +35,10 @@ def test_dry_run_resolves_ours_and_prints_server_and_client_commands(tmp_path):
             str(policy),
             "--episodes",
             "100",
+            "--task-seeds",
+            "10001,10002",
+            "--frozen-episodes",
+            str(frozen),
             "--dry-run",
         ],
         cwd=REPOSITORY_ROOT,
@@ -46,3 +52,5 @@ def test_dry_run_resolves_ours_and_prints_server_and_client_commands(tmp_path):
     assert "evaluation.robotwin.eval_polict_client_openpi" in result.stdout
     assert f"env OMEGA_QVLA_PACK={pack}" in result.stdout
     assert f"env OURS_MIXED_POLICY={policy}" in result.stdout
+    assert "env ROBOTWIN_TASK_SEEDS=10001,10002" in result.stdout
+    assert f"env ROBOTWIN_FROZEN_EPISODES_JSONL={frozen}" in result.stdout

@@ -44,6 +44,13 @@ from scipy.spatial.transform import Rotation as R
 import json
 from pathlib import Path
 
+from evaluation.robotwin.evaluation_state import (
+    append_episode_result,
+    load_frozen_instructions,
+    load_resume_rows,
+    parse_integer_list,
+    seed_task_environment,
+)
 from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
 from evaluation.robotwin.test_render import Sapien_TEST
 
@@ -470,25 +477,99 @@ def eval_policy(task_name,
 
     now_seed = st_seed
     clear_cache_freq = args["clear_cache_freq"]
+    explicit_seed_text = os.environ.get("ROBOTWIN_TASK_SEEDS", "").strip()
+    explicit_episode_id_text = os.environ.get("ROBOTWIN_TASK_EPISODE_IDS", "").strip()
+    frozen_episodes_path = os.environ.get("ROBOTWIN_FROZEN_EPISODES_JSONL", "").strip()
+    task_seeds: list[int] = []
+    episode_ids: list[int] = list(range(test_num))
+    frozen_instructions: dict[int, str] = {}
+    if explicit_seed_text:
+        task_seeds = parse_integer_list(
+            explicit_seed_text,
+            name="ROBOTWIN_TASK_SEEDS",
+            expected_count=test_num,
+        )
+        print(f"[robotwin_client] forcing {len(task_seeds)} task seeds", flush=True)
+    if explicit_episode_id_text:
+        if not task_seeds:
+            raise ValueError("ROBOTWIN_TASK_EPISODE_IDS requires ROBOTWIN_TASK_SEEDS")
+        episode_ids = parse_integer_list(
+            explicit_episode_id_text,
+            name="ROBOTWIN_TASK_EPISODE_IDS",
+            expected_count=test_num,
+        )
+        if min(episode_ids) < 0:
+            raise ValueError("ROBOTWIN_TASK_EPISODE_IDS must be non-negative")
+    if frozen_episodes_path:
+        if not task_seeds:
+            raise ValueError("ROBOTWIN_FROZEN_EPISODES_JSONL requires ROBOTWIN_TASK_SEEDS")
+        frozen_instructions = load_frozen_instructions(frozen_episodes_path, task_seeds)
+        expert_check = False
+        print(
+            f"[robotwin_client] using frozen instructions from {frozen_episodes_path}",
+            flush=True,
+        )
+
+    resume_metrics = os.environ.get("ROBOTWIN_RESUME_METRICS", "").strip()
+    if resume_metrics:
+        if not task_seeds or not frozen_instructions:
+            raise ValueError(
+                "ROBOTWIN_RESUME_METRICS requires explicit task seeds and frozen instructions"
+            )
+        source_rows = Path(resume_metrics) / "episode_results.jsonl"
+        resume_rows = load_resume_rows(
+            source_rows,
+            expected_count=test_num,
+            task_seeds=task_seeds,
+            episode_ids=episode_ids,
+            frozen_instructions=frozen_instructions,
+        )
+        resume_save_dir = Path(args["save_root"]) / f"stseed-{st_seed}" / "metrics" / task_name
+        resume_save_dir.mkdir(parents=True, exist_ok=True)
+        destination_rows = resume_save_dir / "episode_results.jsonl"
+        if destination_rows.exists() and destination_rows.read_text(encoding="utf-8").strip():
+            raise ValueError(f"Refusing to overwrite resumed results: {destination_rows}")
+        destination_rows.write_text(source_rows.read_text(encoding="utf-8"), encoding="utf-8")
+        TASK_ENV.suc = sum(bool(row["success"]) for row in resume_rows)
+        TASK_ENV.test_num = len(resume_rows)
+        now_id = len(resume_rows)
+        succ_seed = len(resume_rows)
+        print(
+            "[robotwin_client] resuming "
+            f"{len(resume_rows)}/{test_num} episodes from {resume_metrics}",
+            flush=True,
+        )
 
     args["eval_mode"] = True
 
     while succ_seed < test_num:
+        if task_seeds:
+            now_seed = task_seeds[succ_seed]
+            now_id = episode_ids[succ_seed]
         render_freq = args["render_freq"]
         args["render_freq"] = 0
 
         if expert_check:
             try:
+                seed_task_environment(now_seed)
                 TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
                 episode_info = TASK_ENV.play_once()
                 TASK_ENV.close_env()
             except UnStableError as e:
                 TASK_ENV.close_env()
+                if task_seeds:
+                    raise RuntimeError(
+                        f"Forced task seed {now_seed} failed expert preflight"
+                    ) from e
                 now_seed += 1
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
                 TASK_ENV.close_env()
+                if task_seeds:
+                    raise RuntimeError(
+                        f"Forced task seed {now_seed} failed expert preflight"
+                    ) from e
                 now_seed += 1
                 args["render_freq"] = render_freq
                 print(f"error occurs ! {e}")
@@ -499,19 +580,25 @@ def eval_policy(task_name,
             succ_seed += 1
             suc_test_seed_list.append(now_seed)
         else:
+            if task_seeds:
+                raise RuntimeError(f"Forced task seed {now_seed} failed expert validation")
             now_seed += 1
             args["render_freq"] = render_freq
             continue
 
         args["render_freq"] = render_freq
 
+        seed_task_environment(now_seed)
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
-        results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        if frozen_instructions:
+            instruction = frozen_instructions[now_seed]
+        else:
+            episode_info_list = [episode_info["info"]]
+            results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
+            instruction = np.random.default_rng(now_seed).choice(results[0][instruction_type])
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
-        if TASK_ENV.eval_video_path is not None:
+        if save_visualization and TASK_ENV.eval_video_path is not None:
             ffmpeg = subprocess.Popen(
                 [
                     "ffmpeg",
@@ -616,18 +703,19 @@ def eval_policy(task_name,
                 break
       
 
-        vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
-        vis_dir.mkdir(parents=True, exist_ok=True)
-        video_name = f"{TASK_ENV.test_num}_{prompt.replace(' ', '_')}_{succ}.mp4"
-        out_img_file = vis_dir / video_name
-        save_comparison_video(
-            real_obs_list=full_obs_list,
-            imagined_video=None, #gen_video_list,
-            action_history=full_action_history,
-            save_path=str(out_img_file),
-            fps=15 # Suggest adjusting fps based on simulation step
-        )
-        if TASK_ENV.eval_video_path is not None:
+        if save_visualization:
+            vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
+            vis_dir.mkdir(parents=True, exist_ok=True)
+            video_name = f"{TASK_ENV.test_num}_{prompt.replace(' ', '_')}_{succ}.mp4"
+            out_img_file = vis_dir / video_name
+            save_comparison_video(
+                real_obs_list=full_obs_list,
+                imagined_video=None, #gen_video_list,
+                action_history=full_action_history,
+                save_path=str(out_img_file),
+                fps=15 # Suggest adjusting fps based on simulation step
+            )
+        if save_visualization and TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
 
         if succ:
@@ -636,6 +724,8 @@ def eval_policy(task_name,
         else:
             print("\033[91mFail!\033[0m")
 
+        episode_index = now_id
+        action_step_count = int(TASK_ENV.take_action_cnt)
         now_id += 1
         TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
 
@@ -652,6 +742,16 @@ def eval_policy(task_name,
           "total_num": float(TASK_ENV.test_num),
           "succ_rate": float(TASK_ENV.suc / TASK_ENV.test_num),
         }, out_json_file)
+        append_episode_result(
+            save_dir / "episode_results.jsonl",
+            {
+                "episode_index": episode_index,
+                "task_seed": int(now_seed),
+                "instruction": str(prompt),
+                "success": bool(succ),
+                "action_step_count": action_step_count,
+            },
+        )
         
         print(
             f"\033[93m{task_name}\033[0m | \033[94m{args['policy_name']}\033[0m | \033[92m{args['task_config']}\033[0m | \033[91m{args['ckpt_setting']}\033[0m\n"
