@@ -8,6 +8,8 @@ CONFIG_NAME=${CONFIG_NAME:-robotwin}
 ENABLE_OFFLOAD=${ENABLE_OFFLOAD:-0}
 SERVER_PYTHON=${SERVER_PYTHON:-python}
 MODELOPT_RESTORE_FROM=${MODELOPT_RESTORE_FROM:-}
+OMEGA_QVLA_PACK=${OMEGA_QVLA_PACK:-}
+OMEGA_QVLA_BRANCHES=${OMEGA_QVLA_BRANCHES:-both}
 
 mkdir -p "$SAVE_ROOT"
 
@@ -17,4 +19,6 @@ mkdir -p "$SAVE_ROOT"
   --enable_offload "$ENABLE_OFFLOAD" \
   --port "$START_PORT" \
   --save_root "$SAVE_ROOT" \
-  ${MODELOPT_RESTORE_FROM:+--modelopt_restore_from "$MODELOPT_RESTORE_FROM"}
+  ${MODELOPT_RESTORE_FROM:+--modelopt_restore_from "$MODELOPT_RESTORE_FROM"} \
+  ${OMEGA_QVLA_PACK:+--omega_qvla_pack "$OMEGA_QVLA_PACK"} \
+  ${OMEGA_QVLA_PACK:+--omega_qvla_branches "$OMEGA_QVLA_BRANCHES"}

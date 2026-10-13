@@ -21,6 +21,7 @@ from configs import VA_CONFIGS
 from distributed.fsdp import shard_model
 from distributed.util import _configure_model, init_distributed
 from modules.modelopt_checkpoint import restore_modelopt_checkpoint
+from modules.omega_qvla_controller import OmegaQVLAOfflinePackController
 from modules.utils import (
     WanVAEStreamingWrapper,
     load_text_encoder,
@@ -103,6 +104,20 @@ class VA_Server:
                                             device=self.device,
                                             eval_mode=True,
                                             )
+        self.omega_qvla_pack = getattr(job_config, 'omega_qvla_pack', None)
+        self.omega_qvla_branches = getattr(job_config, 'omega_qvla_branches', 'both')
+        self._omega_qvla_controller = None
+        if self.omega_qvla_pack:
+            self._omega_qvla_controller = OmegaQVLAOfflinePackController(
+                self.transformer,
+                self.omega_qvla_pack,
+                quantized_branches=self.omega_qvla_branches,
+            )
+            logger.info(
+                "Attached Omega-QVLA pack to %d Linear targets; branches=%s.",
+                len(self._omega_qvla_controller.target_names),
+                self.omega_qvla_branches,
+            )
 
         self.env_type = job_config.env_type
         self.streaming_vae_half = None
@@ -510,6 +525,7 @@ class VA_Server:
                     latent_cond,
                     None,
                     frame_st_id=frame_st_id)
+                self._activate_omega_qvla("latent", i)
 
                 video_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['latent_res_lst']),
@@ -551,6 +567,7 @@ class VA_Server:
                     None,
                     action_cond,
                     frame_st_id=frame_st_id)
+                self._activate_omega_qvla("action", i)
                 action_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['action_res_lst']),
                     update_cache=1 if last_step else 0,
@@ -571,6 +588,8 @@ class VA_Server:
                                                          return_dict=False)
 
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+
+        self._deactivate_omega_qvla()
 
         actions[:, ~self.action_mask] *= 0
 
@@ -600,6 +619,7 @@ class VA_Server:
                                                 action_model_input,
                                                 frame_st_id=self.frame_st_id)
 
+        self._deactivate_omega_qvla()
         with (
                 torch.no_grad(),
         ):
@@ -614,6 +634,14 @@ class VA_Server:
                              action_mode=True)
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
+
+    def _activate_omega_qvla(self, branch, denoise_step):
+        if self._omega_qvla_controller is not None:
+            self._omega_qvla_controller.activate(branch, denoise_step)
+
+    def _deactivate_omega_qvla(self):
+        if self._omega_qvla_controller is not None:
+            self._omega_qvla_controller.deactivate()
 
     @torch.no_grad()
     def infer(self, obs):
@@ -698,6 +726,10 @@ def run(args):
         config.enable_offload = bool(args.enable_offload)
     if args.modelopt_restore_from is not None:
         config.modelopt_restore_from = args.modelopt_restore_from
+    if args.omega_qvla_pack is not None:
+        config.omega_qvla_pack = args.omega_qvla_pack
+    if args.omega_qvla_branches is not None:
+        config.omega_qvla_branches = args.omega_qvla_branches
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -750,6 +782,18 @@ def main():
         type=str,
         default=None,
         help='path to a ModelOpt checkpoint restored before FSDP sharding',
+    )
+    parser.add_argument(
+        "--omega_qvla_pack",
+        type=str,
+        default=None,
+        help='path to an offline Omega-QVLA rank-0 RTN pack',
+    )
+    parser.add_argument(
+        "--omega_qvla_branches",
+        choices=("both", "latent", "action"),
+        default=None,
+        help='generation branches quantized by the Omega-QVLA pack',
     )
     parser.add_argument(
         "--save_root",
