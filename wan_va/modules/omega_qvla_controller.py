@@ -11,6 +11,8 @@ import torch
 from .omega_qvla_activation import OmegaOfflineActivationQdq
 from .omega_qvla_pack import load_rank0_rtn_pack
 from .omega_qvla_rotation import OmegaQVLAInputRotation, OmegaQVLAOutputRotation
+from .mixed_policy import DualBranchMixedPolicy, load_dual_branch_mixed_policy
+from .token_group_amax import TokenGroupAmaxQdq
 
 BranchName = Literal["latent", "action"]
 
@@ -24,6 +26,7 @@ class OmegaQVLAOfflinePackController:
         pack_path: str | Path,
         *,
         quantized_branches: Literal["both", "latent", "action"] = "both",
+        mixed_policy_path: str | Path | None = None,
     ) -> None:
         branch_sets = {
             "both": frozenset(("latent", "action")),
@@ -38,6 +41,10 @@ class OmegaQVLAOfflinePackController:
         self._active_branch: BranchName | None = None
         self._active_step: int | None = None
         self._weights_enabled = False
+        self._mixed_policy: DualBranchMixedPolicy | None = (
+            None if mixed_policy_path is None else load_dual_branch_mixed_policy(mixed_policy_path)
+        )
+        self._online_token_qdq = TokenGroupAmaxQdq(group_size=128)
         self._linears: dict[str, torch.nn.Linear] = {}
         self._weights: dict[str, torch.Tensor] = {}
         self._biases: dict[str, torch.Tensor | None] = {}
@@ -132,14 +139,45 @@ class OmegaQVLAOfflinePackController:
                 raise RuntimeError(f"Omega-QVLA expected one Tensor input for {name}")
             values = args[0]
             transformed = self._input_rotations[name].apply(values)
-            quantized = self._activation_qdqs[name].quantize(
-                transformed,
-                self._active_branch,
-                self._active_step,
-            )
+            if self._mixed_policy is None:
+                quantized = self._activation_qdqs[name].quantize(
+                    transformed,
+                    self._active_branch,
+                    self._active_step,
+                )
+            else:
+                quantized = self._online_token_qdq.quantize_mixed_by_token(
+                    transformed,
+                    self._token_bits(name, transformed.shape[-2]),
+                )
             return (quantized,)
 
         return hook
+
+    def _token_bits(self, name: str, token_count: int) -> torch.Tensor:
+        assert self._active_branch is not None
+        assert self._active_step is not None
+        assert self._mixed_policy is not None
+        name_parts = name.split(".")
+        if len(name_parts) < 3 or name_parts[0] != "blocks" or not name_parts[1].isdigit():
+            raise ValueError(f"Omega-QVLA target does not identify a Transformer block: {name}")
+        block_index = int(name_parts[1])
+        if self._active_branch == "action":
+            expected_tokens, frame_tokens = 32, 16
+            a8_frames = self._mixed_policy.action_a8_frames(block_index, self._active_step)
+        else:
+            expected_tokens, frame_tokens = 240, 120
+            a8_frames = self._mixed_policy.video_a8_frames(block_index, self._active_step)
+        if token_count != expected_tokens:
+            raise ValueError(
+                f"Ours policy expects {expected_tokens} {self._active_branch} tokens for {name}, "
+                f"got {token_count}"
+            )
+        return torch.where(
+            a8_frames.repeat_interleave(frame_tokens),
+            torch.tensor(8, dtype=torch.int64),
+            torch.tensor(4, dtype=torch.int64),
+        )
 
     def _post_hook(self, name: str):
         def hook(_linear: torch.nn.Module, _args: tuple[object, ...], output: torch.Tensor):

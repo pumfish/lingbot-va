@@ -72,3 +72,24 @@ def test_server_launcher_forwards_optional_omega_pack(tmp_path):
 
     assert f"--omega_qvla_pack {pack}" in result.stdout
     assert "--omega_qvla_branches action" in result.stdout
+
+
+def test_server_launcher_forwards_optional_ours_policy(tmp_path):
+    policy = tmp_path / "policy.json"
+    environment = os.environ | {
+        "SERVER_PYTHON": "/bin/echo",
+        "SAVE_ROOT": str(tmp_path / "results"),
+        "MODEL_PATH": "/models/lingbot-va",
+        "OURS_MIXED_POLICY": str(policy),
+    }
+
+    result = subprocess.run(
+        ["bash", str(LAUNCHER)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert f"--ours_mixed_policy {policy}" in result.stdout

@@ -106,12 +106,14 @@ class VA_Server:
                                             )
         self.omega_qvla_pack = getattr(job_config, 'omega_qvla_pack', None)
         self.omega_qvla_branches = getattr(job_config, 'omega_qvla_branches', 'both')
+        self.ours_mixed_policy = getattr(job_config, 'ours_mixed_policy', None)
         self._omega_qvla_controller = None
         if self.omega_qvla_pack:
             self._omega_qvla_controller = OmegaQVLAOfflinePackController(
                 self.transformer,
                 self.omega_qvla_pack,
                 quantized_branches=self.omega_qvla_branches,
+                mixed_policy_path=self.ours_mixed_policy,
             )
             logger.info(
                 "Attached Omega-QVLA pack to %d Linear targets; branches=%s.",
@@ -730,6 +732,8 @@ def run(args):
         config.omega_qvla_pack = args.omega_qvla_pack
     if args.omega_qvla_branches is not None:
         config.omega_qvla_branches = args.omega_qvla_branches
+    if args.ours_mixed_policy is not None:
+        config.ours_mixed_policy = args.ours_mixed_policy
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -794,6 +798,12 @@ def main():
         choices=("both", "latent", "action"),
         default=None,
         help='generation branches quantized by the Omega-QVLA pack',
+    )
+    parser.add_argument(
+        "--ours_mixed_policy",
+        type=str,
+        default=None,
+        help='all-MDP dual-branch A4/A8 policy for online token-group Amax Q/DQ',
     )
     parser.add_argument(
         "--save_root",

@@ -47,3 +47,12 @@ def test_token_group_amax_validates_bit_width_and_channel_groups():
         quantizer.quantize(torch.ones(1, 4), bits=6)
     with pytest.raises(ValueError, match="divisible"):
         quantizer.quantize(torch.ones(1, 6), bits=4)
+
+
+def test_token_group_amax_supports_per_token_a4_a8_selection():
+    quantizer = token_group_amax.TokenGroupAmaxQdq(group_size=2)
+    values = torch.tensor([[[1.0, 1.0 / 7], [1.0, 1.0 / 127]]])
+
+    quantized = quantizer.quantize_mixed_by_token(values, torch.tensor([4, 8]))
+
+    torch.testing.assert_close(quantized, values)

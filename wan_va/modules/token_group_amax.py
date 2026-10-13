@@ -41,3 +41,28 @@ class TokenGroupAmaxQdq:
         scale = grouped.detach().float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
         quantized = symmetric_qdq(grouped, scale / _qmax(bits), bits)
         return quantized.reshape_as(values).to(dtype=values.dtype)
+
+    def quantize_mixed_by_token(self, values: torch.Tensor, token_bits: torch.Tensor) -> torch.Tensor:
+        """Apply A4/A8 Q/DQ where every token receives its selected bit width."""
+        if values.ndim < 3:
+            raise ValueError(f"Expected activation [batch, tokens, channels], got {tuple(values.shape)}")
+        if values.shape[-1] % self.group_size:
+            raise ValueError(
+                "Token-group Amax requires the channel count to be divisible by "
+                f"{self.group_size}, got {values.shape[-1]}"
+            )
+        if token_bits.ndim != 1 or token_bits.numel() != values.shape[-2]:
+            raise ValueError(
+                "token_bits must contain one 4/8-bit value per activation token: "
+                f"tokens={values.shape[-2]}, bits_shape={tuple(token_bits.shape)}"
+            )
+        if not torch.all((token_bits == 4) | (token_bits == 8)):
+            raise ValueError("token_bits must contain only 4 or 8")
+
+        grouped = values.reshape(*values.shape[:-1], -1, self.group_size)
+        qmax = torch.where(token_bits.to(device=values.device) == 8, 127.0, 7.0)
+        qmax = qmax.reshape((1,) * (values.ndim - 2) + (-1, 1, 1))
+        scale = grouped.detach().float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
+        integers = torch.round(grouped.float() / scale)
+        integers = torch.maximum(torch.minimum(integers, qmax), -qmax - 1)
+        return (integers * scale).reshape_as(values).to(dtype=values.dtype)

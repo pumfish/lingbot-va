@@ -1,6 +1,7 @@
 """CPU tests for enabling and disabling an Omega-QVLA offline pack."""
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import types
@@ -35,6 +36,12 @@ class ToyTransformer(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.linear = torch.nn.Linear(8, 8)
+
+
+class BlockToyTransformer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([ToyTransformer()])
 
 
 def _pack(model: ToyTransformer) -> dict[str, object]:
@@ -114,4 +121,39 @@ def test_controller_skips_unselected_branch(tmp_path):
     )
     controller.activate("latent", 0)
     torch.testing.assert_close(model.linear(values), reference)
+    controller.close()
+
+
+def test_controller_expands_dual_branch_policy_by_frame(tmp_path):
+    model = BlockToyTransformer()
+    pack = _pack(model.blocks[0])
+    pack["__meta__"]["targets"] = ["blocks.0.linear"]
+    pack["blocks.0.linear"] = pack.pop("linear")
+    pack_path = tmp_path / "omega.pt"
+    torch.save(pack, pack_path)
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "format": "lingbotva_t2_dual_branch_cell_policy_v1",
+                "mdp_scope": "all_mdps",
+                "action_frame_token_count": 16,
+                "video_frame_token_count": 120,
+                "action_a8_cell_mask": [[[True, False] for _ in range(51)] for _ in range(30)],
+                "video_a8_cell_mask": [[[False, True] for _ in range(26)] for _ in range(30)],
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller = controller_module.OmegaQVLAOfflinePackController(
+        model, pack_path, mixed_policy_path=policy_path
+    )
+
+    controller.activate("action", 0)
+    action_bits = controller._token_bits("blocks.0.linear", 32)
+    controller.activate("latent", 0)
+    video_bits = controller._token_bits("blocks.0.linear", 240)
+
+    assert action_bits.tolist() == [8] * 16 + [4] * 16
+    assert video_bits.tolist() == [4] * 120 + [8] * 120
     controller.close()
