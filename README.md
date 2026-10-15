@@ -86,9 +86,11 @@ pip install flash-attn --no-build-isolation
 
 The `control-aware-ptq` branch provides reproducible RoboTwin runners for BF16,
 Uniform RTN W4A4, DuQuant W4A4, Omega-QVLA W4A4, and the control-aware mixed
-precision method. See [docs/CONTROL_AWARE_PTQ_REPRODUCTION.md](docs/CONTROL_AWARE_PTQ_REPRODUCTION.md)
-for environment requirements, required external artifacts, paired evaluation,
-recovery, portable execution, and the optional Slurm adapter.
+precision method. LingBot-VA is the primary entry point for the two-repository
+setup. See the [English guide](docs/CONTROL_AWARE_PTQ_REPRODUCTION.md) or
+[中文说明](docs/CONTROL_AWARE_PTQ_REPRODUCTION_ZH.md) for environment
+requirements, required external artifacts, paired evaluation, recovery,
+portable execution, and the optional Slurm adapter.
 
 ---
 

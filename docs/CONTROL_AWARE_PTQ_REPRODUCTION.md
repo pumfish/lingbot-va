@@ -24,7 +24,10 @@ and Transformers 4.55.2. Install the official dependencies from `README.md`.
 Install the corresponding ModelOpt checkout separately, in editable mode:
 
 ```bash
-pip install -e /path/to/Model-Optimizer
+git clone --branch lingbotva-ptq https://github.com/pumfish/Model-Optimizer.git
+cd Model-Optimizer
+pip install -e .
+cd ..
 ```
 
 For RoboTwin 2.0, use the official repository at commit `2eeec322` and its
@@ -32,6 +35,25 @@ documented evaluation dependencies, including SAPIEN 3.0.0b1. Set
 `<MODEL_PATH>/transformer/config.json` to `"attn_mode": "torch"` or
 `"flashattn"` before evaluation. `"flex"` is for training and is not a valid
 inference setting.
+
+## Two-Repository Quick Start
+
+Use the two repositories together in this order:
+
+```bash
+git clone https://github.com/pumfish/lingbot-va.git
+cd lingbot-va
+git checkout control-aware-ptq  # Or a main commit that contains this branch.
+
+# Install the matching ModelOpt extension before starting the server.
+git clone --branch lingbotva-ptq https://github.com/pumfish/Model-Optimizer.git ../Model-Optimizer
+python -m pip install -e ../Model-Optimizer
+```
+
+`lingbot-va` owns the server, task runners, Omega packs, and Ours policies.
+`Model-Optimizer` supplies the DuQuant custom backend required when a DuQuant
+checkpoint is restored. Use the same pair of revisions for every compared arm;
+do not substitute the current Model-Optimizer `main` for `lingbotva-ptq`.
 
 ## External Artifacts
 
