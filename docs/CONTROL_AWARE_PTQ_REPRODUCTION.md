@@ -51,6 +51,48 @@ indexes 30 blocks, 26 video denoise steps, and two video frames. Do not use a
 policy produced for a different model, rotation pack, task protocol, or mask
 shape.
 
+## Scope-Matched W4A4 Baselines
+
+Uniform, DuQuant, Omega-QVLA, and Ours use the same DiT weight scope: the six
+projections in each of 30 transformer blocks, for 180 Linear modules total:
+
+```text
+attn1.to_q, attn1.to_k, attn1.to_v, attn1.to_out.0,
+ffn.net.0.proj, ffn.net.2
+```
+
+This scope deliberately excludes cross-attention and non-Linear modules. It is
+the supported shared scope for the Wan adaptation and must not be described as
+whole-model W4A4. All four methods use INT4 per-output-channel weight Q/DQ and
+INT4 per-tensor activation Q/DQ at these targets. Ours selectively raises a
+small, policy-defined subset of action and video activation cells from A4 to
+A8; its weights remain W4 over the same 180 targets.
+
+Build the scope-matched Uniform checkpoint with the same 144-sample calibration
+manifest used by the other arms:
+
+```bash
+python wan_va/script/modelopt_quantize_lingbotva_uniform_w4a4_scope180.py \
+  --model-path /path/to/lingbot-va-robotwin \
+  --calibration-root /path/to/lingbotva_calib_v1 \
+  --save-root ./artifacts/uniform_scope180
+```
+
+Build the scope-matched DuQuant checkpoint with the corresponding deterministic
+DuQuant extension from the `lingbotva-ptq` branch of the paired Model-Optimizer
+repository installed in editable mode:
+
+```bash
+python wan_va/script/modelopt_quantize_lingbotva_duquant_w4a4_scope180.py \
+  --model-path /path/to/lingbot-va-robotwin \
+  --calibration-root /path/to/lingbotva_calib_v1 \
+  --save-root ./artifacts/duquant_scope180
+```
+
+Both builders write a checkpoint and `quantization_manifest.json`. Preserve
+these artifacts with the evaluation output: the manifest records the shared
+scope, calibration-manifest digest, Q/DQ configuration, and checkpoint path.
+
 ## Single Task
 
 `experiments/run_robotwin_task.py` is portable and does not require Slurm. It
@@ -140,6 +182,10 @@ The public interfaces have focused CPU tests. Run them before a GPU campaign:
 python -m pytest -c /dev/null \
   tests/test_modelopt_checkpoint.py \
   tests/test_uniform_rtn.py \
+  tests/test_omega_dit_scope.py \
+  tests/test_calibration_utils.py \
+  tests/test_uniform_scope_builder.py \
+  tests/test_duquant_scope_builder.py \
   tests/test_omega_qvla_rotation.py \
   tests/test_omega_qvla_pack.py \
   tests/test_omega_qvla_activation.py \
