@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Build a Uniform RTN W4A4 checkpoint over the shared Omega DiT-180 scope."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse the checkpoint-build arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", required=True)
+    parser.add_argument("--calibration-root", required=True)
+    parser.add_argument("--save-root", required=True)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="bfloat16")
+    return parser.parse_args()
+
+
+def build_manifest(
+    args: argparse.Namespace,
+    calibration_count: int,
+    calibration_sha256: str,
+    total_weight_bytes: int,
+    scope: dict[str, Any],
+    quant_config: dict[str, Any],
+    checkpoint: Path,
+) -> dict[str, Any]:
+    """Return the provenance record for a scope-matched Uniform checkpoint."""
+    return {
+        "baseline": "Uniform_RTN_W4A4_OmegaDiT180",
+        "comparison_scope": "omega_qvla_dit_180",
+        "model_path": args.model_path,
+        "calibration_root": args.calibration_root,
+        "calibration_manifest_sha256": calibration_sha256,
+        "calibration_sample_count": calibration_count,
+        "dtype": args.dtype,
+        "quantization": "weight_int4_per_channel_activation_int4_per_tensor",
+        "quant_config": quant_config,
+        "total_transformer_linear_weight_bytes": total_weight_bytes,
+        **scope,
+        "checkpoint": str(checkpoint),
+    }
+
+
+def main() -> None:
+    """Quantize the shared target scope and serialize its checkpoint and provenance."""
+    repo_root = Path(__file__).resolve().parents[2]
+    wan_va_root = repo_root / "wan_va"
+    if str(wan_va_root) not in sys.path:
+        sys.path.insert(0, str(wan_va_root))
+
+    import modelopt.torch.opt as mto
+    import modelopt.torch.quantization as mtq
+    import torch
+    from modules.calibration_utils import (
+        calibration_forward,
+        load_calibration_samples,
+        resolve_dtype,
+        sha256_file,
+    )
+    from modules.omega_dit_scope import (
+        modelopt_w4a4_config,
+        omega_dit_target_names,
+        total_transformer_linear_weight_bytes,
+        verify_scope_quantizers,
+    )
+    from modules.utils import load_transformer
+
+    args = parse_args()
+    calibration_root = Path(args.calibration_root)
+    sample_paths = load_calibration_samples(calibration_root)
+    save_root = Path(args.save_root)
+    save_root.mkdir(parents=True, exist_ok=True)
+    dtype = resolve_dtype(args.dtype)
+    device = torch.device(args.device)
+    transformer = load_transformer(
+        os.path.join(args.model_path, "transformer"), torch_dtype=dtype, torch_device=device
+    )
+    targets = omega_dit_target_names(len(transformer.blocks))
+    total_weight_bytes = total_transformer_linear_weight_bytes(transformer)
+    quant_config = modelopt_w4a4_config(targets)
+    mtq.quantize(
+        transformer,
+        copy.deepcopy(quant_config),
+        lambda model: calibration_forward(model, sample_paths, device, dtype),
+    )
+    scope = verify_scope_quantizers(transformer, targets)
+    scope["quantized_weight_byte_fraction"] = scope["quantized_weight_bytes"] / total_weight_bytes
+
+    checkpoint = save_root / "transformer_modelopt_uniform_w4a4_scope180.pt"
+    mto.save(transformer, str(checkpoint))
+    manifest = build_manifest(
+        args,
+        calibration_count=len(sample_paths),
+        calibration_sha256=sha256_file(calibration_root / "manifest.json"),
+        total_weight_bytes=total_weight_bytes,
+        scope=scope,
+        quant_config=quant_config,
+        checkpoint=checkpoint,
+    )
+    (save_root / "quantization_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    print(f"[uniform_scope180] calibration_samples={len(sample_paths)}")
+    print(f"[uniform_scope180] enabled_quantizers={scope['enabled_quantizer_counts']}")
+    print(f"[uniform_scope180] checkpoint={checkpoint}")
+
+
+if __name__ == "__main__":
+    main()
